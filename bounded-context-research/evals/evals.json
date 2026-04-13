@@ -1,0 +1,29 @@
+{
+  "skill_name": "bounded-context-research",
+  "evals": [
+    {
+      "id": 0,
+      "prompt": "quick check: who owns Letterboxd now, and what year was it acquired? keep it short and give me the source URL you trusted most.",
+      "expected_output": "A short, grounded answer that names the current owner, gives the acquisition year, and cites a trusted source URL.",
+      "files": []
+    },
+    {
+      "id": 1,
+      "prompt": "who won the 2024 Nobel Prize in Chemistry, what exactly was each person recognized for, and where are they affiliated? please cite the sources you relied on.",
+      "expected_output": "A grounded answer that names all laureates, their recognized contributions, their affiliations, and the sources used.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "I keep seeing people say every iPhone browser is just Safari underneath. Is that actually true, and does the EU change the answer? Keep it brief and link the sources you used.",
+      "expected_output": "A brief, sourced answer that distinguishes the historical WebKit rule from the EU-specific change and avoids overstatement.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "What's the best current estimate of Letterboxd's monthly active users? Give the number only if you can ground it in a primary or clearly attributed source; otherwise say you couldn't verify a current figure and cite what you found.",
+      "expected_output": "A sourced answer that either provides a well-grounded current MAU figure or explicitly says the figure could not be verified.",
+      "files": []
+    }
+  ]
+}
