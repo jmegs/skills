@@ -1,32 +1,31 @@
 # Middleware
 
-Middleware functions run on every request before route handlers. Use for security headers, CORS, caching, logging, sessions, and authentication.
+Middleware runs before route matching. Use it for cross-cutting concerns: headers, sessions, auth context, CORS, logging, cache policy, and request metadata.
 
-## Middleware vs Interruptors
+## Middleware vs Interrupters
 
-- **Middleware**: Every request. Defined in `defineApp` before routes. Cross-cutting concerns.
-- **Interruptors**: Per-route. Defined in route arrays. Route-specific concerns.
+- Middleware: global; declared in `defineApp` before routes.
+- Interrupters: route-scoped; declared in route arrays.
+
+Server Action requests also pass through the global middleware pipeline. Use `isAction` for page-only behavior.
 
 ## Basic Structure
 
 ```tsx
 import { defineApp, ErrorResponse } from "rwsdk/worker";
 import { route, render } from "rwsdk/router";
-import { setCommonHeaders } from "rwsdk/headers";
 import { defineDurableSession } from "rwsdk/auth";
 import { env } from "cloudflare:workers";
+import { setCommonHeaders } from "@/app/headers";
 import { Document } from "@/app/Document";
 
 export const sessionStore = defineDurableSession({
   sessionDurableObject: env.USER_SESSION_DO,
 });
 
-const app = defineApp([
-  // 1. Security headers
+export const app = defineApp([
   setCommonHeaders(),
-
-  // 2. Session + auth middleware
-  async ({ ctx, request, response }) => {
+  async ({ ctx, request, response, isAction }) => {
     try {
       ctx.session = await sessionStore.load(request);
     } catch (error) {
@@ -38,34 +37,27 @@ const app = defineApp([
       throw error;
     }
 
-    if (ctx.session?.userId) {
-      const [user] = await db
-        .select()
-        .from(users)
-        .where(eq(users.id, ctx.session.userId));
-      ctx.user = user;
+    if (!isAction) {
+      response.headers.set("X-Frame-Options", "DENY");
     }
   },
-
-  // 3. Routes wrapped in Document
-  render(Document, [
-    route("/", HomePage),
-    // ...
-  ]),
+  render(Document, [route("/", HomePage)]),
 ]);
 ```
 
 ## Context
 
-The `ctx` object is mutable and request-scoped. Populate it in middleware, access it in route handlers, interruptors, and server components (via props). Server actions access it via `requestInfo.ctx`.
-
-Server actions also pass through the middleware pipeline.
-
-## Extending Context Types
-
-Define in `global.d.ts`:
+`ctx` is mutable and request-scoped. Populate it in middleware; access it in route handlers, interrupters, server components, and server functions.
 
 ```tsx
+async ({ ctx }) => {
+  ctx.user = await findUser(ctx.session?.userId);
+}
+```
+
+Extend app context types in `global.d.ts`.
+
+```ts
 import { DefaultAppContext } from "rwsdk/worker";
 
 interface AppContext {
@@ -78,10 +70,23 @@ declare module "rwsdk/worker" {
 }
 ```
 
-## Key Points
+## Headers
 
-1. `setCommonHeaders()` from `rwsdk/headers` adds security headers automatically.
-2. Middleware has access to `ctx`, `request`, and `response`.
-3. Return a `Response` to short-circuit (e.g., redirect on auth failure).
-4. Populate `ctx` with session/user data for downstream routes.
-5. Worker entry is `src/worker.tsx`.
+RedwoodSDK exposes `response.headers`; mutate it directly.
+
+```tsx
+import type { RouteMiddleware } from "rwsdk/worker";
+
+export const setCommonHeaders =
+  (): RouteMiddleware =>
+  ({ response, rw: { nonce } }) => {
+    response.headers.set("X-Frame-Options", "DENY");
+    response.headers.set("X-Content-Type-Options", "nosniff");
+    response.headers.set(
+      "Content-Security-Policy",
+      `default-src 'self'; script-src 'self' 'nonce-${nonce}'; object-src 'none';`,
+    );
+  };
+```
+
+Do not use removed context `headers`; set outgoing headers via `response.headers`.

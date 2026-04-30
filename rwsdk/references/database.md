@@ -1,180 +1,144 @@
 # Database
 
-rwsdk runs on Cloudflare Workers, so **D1** (Cloudflare's native SQLite database) is the natural default. rwsdk doesn't prescribe how you query D1 — use the native binding with prepared statements, Drizzle ORM, or whatever you prefer.
+RedwoodSDK is database-agnostic. It runs on Cloudflare Workers, so D1 is a common choice, but the SDK does not prescribe ORM, schema tool, or query layer.
 
-## D1 Setup
+Use the project’s existing data layer when present. For new code, choose the smallest query layer that fits: native D1 prepared statements, Drizzle, a remote API, external database, or another Cloudflare binding.
 
-### 1. Create Database
+## D1 Binding
+
+Create a D1 database:
 
 ```bash
 npx wrangler d1 create my-app-db
 ```
 
-Add the binding to `wrangler.jsonc`:
+Add binding to `wrangler.jsonc`:
 
 ```jsonc
 {
   "d1_databases": [
-    { "binding": "DB", "database_name": "my-app-db", "database_id": "<id-from-above>" }
+    {
+      "binding": "DB",
+      "database_name": "my-app-db",
+      "database_id": "<id-from-command>"
+    }
   ]
 }
 ```
 
-Run `pnpm generate` (or `npx wrangler types`) to regenerate the `Env` type with the new binding.
+Regenerate types after binding changes:
 
-### 2. Access the Binding
-
-```ts
-import { env } from "cloudflare:workers";
-
-// env.DB is your D1Database binding
+```bash
+pnpm generate
+# or
+npx wrangler types
 ```
 
-## Query Layer Options
-
-### Option A: Native D1 Prepared Statements
-
-Zero dependencies. Just SQL. Good for simple apps or if you want full control.
+Access bindings via Cloudflare Workers env:
 
 ```ts
 import { env } from "cloudflare:workers";
 
-// Create
-await env.DB.prepare("INSERT INTO todos (id, text, completed) VALUES (?, ?, ?)")
-  .bind(crypto.randomUUID(), "Ship it", 0)
+const db = env.DB;
+```
+
+## Native D1
+
+Native D1 is zero extra dependency and works well for direct SQL.
+
+```ts
+import { env } from "cloudflare:workers";
+
+await env.DB.prepare("INSERT INTO todos (id, title, completed) VALUES (?, ?, ?)")
+  .bind(crypto.randomUUID(), title, 0)
   .run();
 
-// Read
 const todo = await env.DB.prepare("SELECT * FROM todos WHERE id = ?")
   .bind(todoId)
   .first();
 
-const allTodos = await env.DB.prepare("SELECT * FROM todos ORDER BY created_at DESC")
-  .all();
-
-// Update
-await env.DB.prepare("UPDATE todos SET completed = 1 WHERE id = ?")
-  .bind(todoId)
-  .run();
-
-// Delete
-await env.DB.prepare("DELETE FROM todos WHERE id = ?")
-  .bind(todoId)
-  .run();
+const { results } = await env.DB.prepare("SELECT * FROM todos ORDER BY created_at DESC").all();
 ```
 
-Manage schema with [D1 migrations](https://developers.cloudflare.com/d1/reference/migrations/):
+Manage schema with D1 migrations:
 
 ```bash
 npx wrangler d1 migrations create my-app-db init
-# edit the generated SQL file, then:
-npx wrangler d1 migrations apply my-app-db --local    # dev
-npx wrangler d1 migrations apply my-app-db --remote   # production
+npx wrangler d1 migrations apply my-app-db --local
+npx wrangler d1 migrations apply my-app-db --remote
 ```
 
-### Option B: Drizzle ORM
+## Drizzle
 
-Type-safe query builder with schema-as-code. The most popular ORM in the Cloudflare ecosystem.
-
-**Install:**
+Use Drizzle when the project wants schema-as-code and typed query builder ergonomics.
 
 ```bash
 pnpm add drizzle-orm
 pnpm add -D drizzle-kit
 ```
 
-**Define schema** (`src/db/schema.ts`):
-
 ```ts
-import { sqliteTable, text, integer } from "drizzle-orm/sqlite-core";
+// src/db/schema.ts
+import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 
 export const todos = sqliteTable("todos", {
   id: text("id").primaryKey(),
-  text: text("text").notNull(),
+  title: text("title").notNull(),
   completed: integer("completed").notNull().default(0),
   createdAt: text("created_at").notNull(),
 });
 ```
 
-**Configure Drizzle** (`drizzle.config.ts`):
-
 ```ts
-import { defineConfig } from "drizzle-kit";
-
-export default defineConfig({
-  out: "./drizzle",
-  schema: "./src/db/schema.ts",
-  dialect: "sqlite",
-});
-```
-
-**Migrations:**
-
-```bash
-npx drizzle-kit generate                              # generate SQL from schema
-npx wrangler d1 migrations apply my-app-db --local    # dev
-npx wrangler d1 migrations apply my-app-db --remote   # production
-```
-
-**Create client** (`src/db/index.ts`):
-
-```ts
-import { drizzle } from "drizzle-orm/d1";
+// src/db/index.ts
 import { env } from "cloudflare:workers";
+import { drizzle } from "drizzle-orm/d1";
 import * as schema from "./schema";
 
 export const db = drizzle(env.DB, { schema });
 ```
 
-**Query:**
-
 ```ts
+import { eq } from "drizzle-orm";
 import { db } from "@/db";
 import { todos } from "@/db/schema";
-import { eq } from "drizzle-orm";
 
-await db.insert(todos).values({ id: crypto.randomUUID(), text: "Ship it", completed: 0, createdAt: new Date().toISOString() });
-const allTodos = await db.select().from(todos);
+await db.insert(todos).values({
+  id: crypto.randomUUID(),
+  title,
+  completed: 0,
+  createdAt: new Date().toISOString(),
+});
+
+const rows = await db.select().from(todos);
 const [todo] = await db.select().from(todos).where(eq(todos.id, todoId));
-await db.update(todos).set({ completed: 1 }).where(eq(todos.id, todoId));
-await db.delete(todos).where(eq(todos.id, todoId));
 ```
 
-**Docs:** [Drizzle + D1 guide](https://orm.drizzle.team/docs/get-started/d1-new)
+## Server Functions
 
-### Option C: Experimental — SQLite Durable Objects + Kysely
-
-rwsdk ships an experimental built-in layer that uses SQLite inside Durable Objects with Kysely as query builder. Types are inferred directly from migrations — no codegen. This is best suited for use cases that benefit from DO isolation (per-user databases, collaborative editing) rather than general-purpose storage. Has rough edges.
-
-See the [rwsdk database docs](https://docs.rwsdk.com) for setup.
-
-## Using D1 in Server Functions
+Use the chosen query layer from server components, route handlers, and server functions.
 
 ```ts
 "use server";
 
-import { serverAction, serverQuery } from "rwsdk/worker";
-import { db } from "@/db";
-import { todos } from "@/db/schema";
+import { getRequestInfo, serverAction, serverQuery } from "rwsdk/worker";
 
 export const getTodos = serverQuery(async () => {
-  return db.select().from(todos);
+  const { ctx } = getRequestInfo();
+  return listTodos(ctx.user.id);
 });
 
 export const createTodo = serverAction(async (formData: FormData) => {
-  await db.insert(todos).values({
-    id: crypto.randomUUID(),
-    text: formData.get("text") as string,
-    completed: 0,
-    createdAt: new Date().toISOString(),
+  const { ctx } = getRequestInfo();
+  await insertTodo({
+    title: String(formData.get("title") ?? ""),
+    userId: ctx.user.id,
   });
 });
 ```
 
-## Docs
+## Opt-In Experimental: rwsdk/db
 
-- [Cloudflare D1 docs](https://developers.cloudflare.com/d1/)
-- [D1 migrations](https://developers.cloudflare.com/d1/reference/migrations/)
-- [Drizzle ORM docs](https://orm.drizzle.team/docs/overview)
-- [Drizzle + D1 guide](https://orm.drizzle.team/docs/get-started/d1-new)
-- [rwsdk docs](https://docs.rwsdk.com)
+`rwsdk/db` is experimental. Do not use it as the default recommendation. Mention it only when the user explicitly asks about the experimental SDK database or the project already uses `rwsdk/db`.
+
+Current docs describe SQLite Durable Objects plus Kysely, with types inferred from migrations. Each database instance is isolated in its own Durable Object. Migration rollback is best effort; write idempotent `down()` functions because SQLite DDL is not fully transactional.

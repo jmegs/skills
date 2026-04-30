@@ -1,162 +1,194 @@
 # Routing & Request Handling
 
-## Route Definition
+Import router helpers from `rwsdk/router`. Import `defineApp` and worker-side helpers from `rwsdk/worker`.
 
-Use `route` from `rwsdk/router`. Routes match in definition order. Trailing slashes normalized.
+## Matching
 
-### Static Paths
+Routes match in definition order. Trailing slashes are normalized.
 
 ```tsx
-route("/", () => <>Home</>)
-route("/about", () => <>About</>)
+import { defineApp } from "rwsdk/worker";
+import { route, prefix, render } from "rwsdk/router";
+
+export default defineApp([
+  route("/", () => <Home />),
+  route("/about", () => new Response("About")),
+  route("/users/:id", ({ params }) => <User id={params.id} />),
+  route("/files/*", ({ params }) => new Response(params.$0)),
+]);
 ```
 
-### Dynamic Parameters
+Patterns:
+
+- Static: `/about`
+- Parameter: `/users/:id`
+- Wildcard: `/files/*`, exposed as `params.$0`, `params.$1`, etc.
+
+## Query Parameters
+
+Use the standard URL API.
 
 ```tsx
-route("/users/:id", ({ params }) => <>User {params.id}</>)
-route("/posts/:postId/comments/:commentId", ({ params }) => (
-  <>Comment {params.commentId} on Post {params.postId}</>
-))
-```
-
-### Wildcards
-
-```tsx
-route("/files/*", ({ params }) => <>File: {params.$0}</>)
-route("/docs/*/version/*", ({ params }) => <>Doc: {params.$0}, Version: {params.$1}</>)
+route("/search", ({ request }) => {
+  const url = new URL(request.url);
+  const q = url.searchParams.get("q") ?? "";
+  const tags = url.searchParams.getAll("tag");
+  return Response.json({ q, tags });
+});
 ```
 
 ## HTTP Method Routing
 
-Pass an object with method keys to handle different verbs on the same path. Supports `get`, `post`, `delete`, `put`, `patch`, `custom`. Automatic OPTIONS and 405 handling.
+Pass method handlers to one route. Method handlers can be functions or arrays of interrupters plus final handler.
 
 ```tsx
 route("/api/users", {
-  get: () => Response.json(users),
-  post: async ({ request }) => {
-    const data = await request.json();
-    return new Response("Created", { status: 201 });
+  get: listUsers,
+  head: listUsers,
+  post: [requireAuth, validateUser, createUser],
+  put: updateUser,
+  patch: patchUser,
+  delete: deleteUser,
+  custom: {
+    report: reportUsers,
   },
-  delete: () => new Response(null, { status: 204 }),
-})
-
-// Method handlers can include interruptors:
-route("/api/admin", {
-  get: [requireAuth, listAdmins],
-  post: [requireAuth, isAdmin, createAdmin],
-})
+  config: {
+    disableOptions: true,
+    disable405: true,
+  },
+});
 ```
 
-## Response Types
+Defaults:
+
+- `OPTIONS` returns `204 No Content` with `Allow`.
+- Unsupported methods return `405 Method Not Allowed`.
+- `HEAD` is not mapped to `GET`; add `head` explicitly.
+- `custom` handles non-standard methods case-insensitively.
+
+## Interrupters
+
+Interrupters are route-scoped middleware. They run left to right before the final handler. Mutate `ctx` to share data; return a `Response` to stop the chain.
 
 ```tsx
-// JSX
-route("/page", () => <MyComponent />)
+async function requireAuth({ ctx }) {
+  if (!ctx.user) return new Response("Unauthorized", { status: 401 });
+}
 
-// JSON
-route("/api/data", ({ params }) => Response.json({ id: params.id }))
-
-// Plain text
-route("/health", () => new Response("OK", {
-  headers: { "Content-Type": "text/plain" },
-}))
-
-// With Document wrapper
-render(Document, [
-  route("/", () => <>Home</>),
-  route("/about", () => <>About</>),
-])
+route("/admin", [requireAuth, ({ ctx }) => <Admin user={ctx.user} />]);
 ```
 
-## Query Parameters
+The docs spell this "interrupters"; older/user wording may say "interruptors".
 
-Standard Web Request URL API:
+## Middleware & Context
+
+Middleware is declared in `defineApp` before routes. It runs before route matching and also runs for Server Action requests. Use `isAction` to skip page-only work.
 
 ```tsx
-route("/api/search", ({ request }) => {
-  const url = new URL(request.url);
-  const query = url.searchParams.get("q") || "";
-  const page = parseInt(url.searchParams.get("page") || "1");
-  const tags = url.searchParams.getAll("tag");
-  return Response.json({ query, page, tags });
-})
+export default defineApp([
+  async ({ ctx, request, response, isAction }) => {
+    ctx.session = await loadSession(request);
+    if (!isAction) response.headers.set("X-Page-Request", "1");
+  },
+  route("/hello", ({ ctx }) => new Response(`Hello ${ctx.user?.name ?? "anon"}`)),
+]);
 ```
 
-## Co-located Routes with Prefix
+Extend context types in `global.d.ts`:
 
-`src/app/pages/blog/routes.ts`:
+```ts
+import { DefaultAppContext } from "rwsdk/worker";
+
+interface AppContext {
+  user?: User;
+  session?: { userId: string | null };
+}
+
+declare module "rwsdk/worker" {
+  interface DefaultAppContext extends AppContext {}
+}
+```
+
+## Documents & render
+
+Documents define the HTML shell. Include the client entry if you need hydration.
 
 ```tsx
-import { route } from "rwsdk/router";
-import { requireAuth } from "@/app/interruptors";
-import { BlogList } from "./BlogList";
-import { BlogPost } from "./BlogPost";
+export function Document({ children, rw }) {
+  return (
+    <html lang="en">
+      <head>
+        <meta charSet="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <script type="module" src="/src/client.tsx" nonce={rw.nonce} />
+      </head>
+      <body>{children}</body>
+    </html>
+  );
+}
 
-export const routes = [
-  route("/", BlogList),
-  route("/post/:postId", BlogPost),
-  route("/post/:postId/edit", [requireAuth, BlogEditPage]),
-];
+render(Document, [route("/", Home)]);
 ```
 
-Import in `worker.tsx`:
+`render(Document, routes, options)` supports:
+
+- `rscPayload` default `true`; disable only for static output with no client interactivity.
+- `ssr` default `true`; set `false` for client-only routes that need browser APIs.
+
+## Error Handling
+
+Use `except` for route-tree error handling. It catches errors from middleware, route handlers, route arrays, and RSC actions. Nested handlers bubble by returning `void`.
 
 ```tsx
-import { routes as blogRoutes } from "@/app/pages/blog/routes";
+import { except, route } from "rwsdk/router";
 
-// Inside defineApp:
-render(Document, [
-  route("/", HomePage),
-  prefix("/blog", blogRoutes),
-])
+export default defineApp([
+  except((error) => {
+    console.error(error);
+    return <ErrorPage error={error} />;
+  }),
+  route("/", Home),
+]);
 ```
 
-## Type-Safe Links with `linkFor`
-
-```tsx
-import { linkFor } from "rwsdk/router";
-import type * as Worker from "../../worker";
-type App = typeof Worker.default;
-
-export const link = linkFor<App>();
-
-// Usage — type-checked against your actual routes:
-const home = link("/");
-const userProfile = link("/users/:id", { id: user.id });
-const callDetails = link("/calls/details/:id", { id: call.id });
-```
-
-## Prefetching
-
-Include `<link rel="x-prefetch">` elements. RedwoodSDK scans for these and issues background GET requests with `__rsc` query param and `x-prefetch: true` header, caching responses for faster navigation.
-
-```tsx
-<link rel="x-prefetch" href={link("/about")} />
-```
-
-## Documents
-
-The HTML shell for your app. Used with `render()`:
-
-```tsx
-export const Document: React.FC<{ children: React.ReactNode; rw: { nonce: string } }> = ({
-  children,
-  rw,
-}) => (
-  <html lang="en">
-    <head>
-      <meta charSet="utf-8" />
-      <meta name="viewport" content="width=device-width, initial-scale=1" />
-      <script type="module" src="/src/client.tsx"></script>
-    </head>
-    <body>{children}</body>
-  </html>
-);
-```
-
-The `rw` prop provides `nonce` for inline script CSP compliance.
+For structured status errors, throw or return `ErrorResponse` from `rwsdk/worker` where appropriate.
 
 ## Request Info
 
-`requestInfo` and `getRequestInfo()` from `rwsdk/worker` provide access to `request`, `response`, `ctx`, `rw`, `cf`. Mutate `response.status` and `response.headers` to configure outgoing response.
+Use `requestInfo` or `getRequestInfo()` from `rwsdk/worker` in server functions.
+
+```tsx
+import { getRequestInfo } from "rwsdk/worker";
+
+export async function myServerFunction() {
+  const { request, response, ctx, rw, cf } = getRequestInfo();
+  response.headers.set("Cache-Control", "no-store");
+}
+```
+
+`getRequestInfo()` throws outside a request lifecycle. `requestInfo` exposes request-scoped fields.
+
+## linkFor
+
+Create a typed link helper from the exported app type.
+
+```tsx
+// worker.tsx
+export const app = defineApp([render(Document, [route("/users/:id", UserPage)])]);
+export default { fetch: app.fetch } satisfies ExportedHandler<Env>;
+
+// app/shared/links.ts
+import { linkFor } from "rwsdk/router";
+import type * as Worker from "../../worker";
+
+type App = typeof Worker.app;
+export const link = linkFor<App>();
+
+link("/users/:id", { id: user.id });
+```
+
+If the worker default export is the app itself, use `typeof Worker.default`.
+
+## Prefetch
+
+When client navigation is enabled, add `<link rel="x-prefetch" href={href} />` for likely next pages. RedwoodSDK fetches the RSC payload in the background with `__rsc` and `x-prefetch: true`, then uses the browser Cache API for the next navigation.

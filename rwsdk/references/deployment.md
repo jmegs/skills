@@ -1,47 +1,40 @@
-# Deployment, Environment, & Security
+# Deployment, Environment, Security
 
-## Environment Variables
+## Environment Variables & Bindings
 
-### Development
+For local secrets, create `.env` in the project root. RedwoodSDK dev links this into the Worker local env flow.
 
-Create `.env` file in project root:
-
-```
+```dotenv
 SECRET_KEY=value
 API_TOKEN=ABCDEFGHIJKLMNOPQRSTUVWXYZ
 ```
 
-`pnpm dev` auto-symlinks `.env` → `.dev.vars`.
-
-After adding new vars, regenerate types:
+For production secrets:
 
 ```bash
-npx wrangler types
+npx wrangler secret put API_TOKEN
 ```
 
-### Production Secrets
-
-```bash
-npx wrangler secret put <KEY>
-# CLI prompts for the value
-```
-
-Also manageable via Cloudflare dashboard: Workers > Settings > Variables and Secrets.
-
-### Using Environment Variables
+Access env/bindings directly:
 
 ```tsx
 import { env } from "cloudflare:workers";
 
-const apiKey = env.API_TOKEN;
-const rpID = env.WEBAUTHN_RP_ID ?? new URL(request.url).hostname;
+const token = env.API_TOKEN;
+const db = env.DB;
 ```
 
-Always use `import { env } from "cloudflare:workers"` — no env threading through context needed.
+After adding bindings or vars to `wrangler.jsonc`, regenerate types:
 
-### Staging / Production Configs
+```bash
+pnpm generate
+# or
+npx wrangler types
+```
 
-`wrangler.jsonc`:
+## Environments
+
+Use Wrangler environment config for staging/production differences.
 
 ```jsonc
 {
@@ -62,89 +55,95 @@ Always use `import { env } from "cloudflare:workers"` — no env threading throu
 Environment-scoped secrets:
 
 ```bash
-npx wrangler secret put DATABASE_URL --env staging
+npx wrangler secret put API_TOKEN --env staging
 ```
 
----
+## Deploy
 
-## Hosting & Deployment
-
-### Deploy to Production
+Deploy using the project release script:
 
 ```bash
 pnpm release
 ```
 
-Prompts for confirmation. View at: Cloudflare dashboard > Workers & Pages > project > Visit.
-
-### Deploy to Staging
+Deploy staging when configured:
 
 ```bash
 CLOUDFLARE_ENV=staging pnpm release
 ```
 
-Loads config from the matching `env` entry in `wrangler.jsonc`.
+First deploy may require creating a `workers.dev` subdomain in Cloudflare.
 
-### Custom Domain
+## Security Headers
 
-1. Add domain to Cloudflare (purchase or transfer nameservers)
-2. Workers & Pages > project > Settings > Domains & Routes > + Add > Custom Domain
-3. Enter domain name
+Create application-owned header middleware. Current docs show this pattern rather than an SDK `rwsdk/headers` import.
 
-### Delete Project
+```tsx
+import type { RouteMiddleware } from "rwsdk/worker";
 
-Workers & Pages > project > Settings > scroll to bottom > Delete > confirm.
+export const setCommonHeaders =
+  (): RouteMiddleware =>
+  ({ response, rw: { nonce } }) => {
+    const headers = response.headers;
 
----
+    headers.set("X-Frame-Options", "DENY");
+    headers.set("X-Content-Type-Options", "nosniff");
+    headers.set("Referrer-Policy", "strict-origin-when-cross-origin");
+    headers.set(
+      "Content-Security-Policy",
+      `default-src 'self'; script-src 'self' 'nonce-${nonce}'; style-src 'self' 'unsafe-inline'; object-src 'none';`,
+    );
+    headers.set("Permissions-Policy", "geolocation=(), microphone=(), camera=()");
+  };
+```
 
-## Security
+Apply it in `worker.tsx` before routes:
 
-### CSP Headers
+```tsx
+export default defineApp([
+  setCommonHeaders(),
+  render(Document, [route("/", Home)]),
+]);
+```
 
-`setCommonHeaders()` sets default security headers. Customize CSP:
+## CSP
+
+Add domains only as needed:
 
 ```tsx
 headers.set(
   "Content-Security-Policy",
-  `default-src 'self'; script-src 'self' 'nonce-${nonce}'; style-src 'self' 'unsafe-inline'; object-src 'none';`,
+  `default-src 'self'; script-src 'self' 'nonce-${nonce}' https://trusted-scripts.example.com; img-src 'self' https://images.example.com data:; object-src 'none';`,
 );
 ```
 
-#### Adding Trusted Domains
+## Nonce
+
+RedwoodSDK generates a request nonce on `rw.nonce`. Use it for trusted inline scripts.
 
 ```tsx
-`script-src 'self' 'nonce-${nonce}' https://trusted-scripts.example.com;`
+export function Document({ children, rw }) {
+  return (
+    <html lang="en">
+      <body>
+        {children}
+        <script nonce={rw.nonce}>{`window.appReady = true;`}</script>
+      </body>
+    </html>
+  );
+}
 ```
 
-#### Multiple Image Sources
+Do not apply nonces to untrusted/user-generated scripts.
+
+## Device Permissions
+
+Relax `Permissions-Policy` only when the app needs device access:
 
 ```tsx
-`img-src 'self' https://images.example.com data:;`
+headers.set("Permissions-Policy", "geolocation=self, microphone=self, camera=self");
 ```
 
-### Nonce for Inline Scripts
+## Hosting
 
-RedwoodSDK generates a nonce via `rw.nonce` in Document components:
-
-```tsx
-export const Document = ({ rw, children }) => (
-  <html lang="en">
-    <head><meta charSet="utf-8" /></head>
-    <body>
-      {children}
-      <script nonce={rw.nonce}>{`/* trusted inline script */`}</script>
-    </body>
-  </html>
-);
-```
-
-### Device Permissions
-
-Modify `Permissions-Policy` header:
-
-```tsx
-headers.set(
-  "Permissions-Policy",
-  "geolocation=self, microphone=self, camera=self",
-);
-```
+For custom domains, add the domain in Cloudflare Workers & Pages settings and bind route/domain config in `wrangler.jsonc` as needed. Keep preview/staging/prod config explicit and environment-scoped.

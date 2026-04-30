@@ -1,43 +1,38 @@
 # React Server Components & Server Functions
 
-## Server Components (Default)
+## Server Components
 
-All components are server components by default. They render on the server, stream as HTML. Can be async. Cannot use state, effects, or event handlers.
+Components are server components by default. They render on the server, stream HTML, can be async, and cannot use browser-only APIs, state, effects, or event handlers.
 
 ```tsx
-import { db } from "@/db";
-import { todos } from "@/db/schema";
-import { eq } from "drizzle-orm";
-
 export async function TodoList({ ctx }) {
-  const items = await db.select().from(todos).where(eq(todos.userId, ctx.user.id));
+  const todos = await getTodosForUser(ctx.user.id);
 
   return (
     <ol>
-      {items.map((todo) => <li key={todo.id}>{todo.title}</li>)}
+      {todos.map((todo) => (
+        <li key={todo.id}>{todo.title}</li>
+      ))}
     </ol>
   );
 }
 ```
 
-Wrap async server components in Suspense:
+Wrap async server components in `Suspense` when you want a loading boundary.
 
 ```tsx
 export function TodoPage({ ctx }) {
   return (
-    <div>
-      <h1>Todos</h1>
-      <Suspense fallback={<div>Loading...</div>}>
-        <TodoList ctx={ctx} />
-      </Suspense>
-    </div>
+    <Suspense fallback={<div>Loading...</div>}>
+      <TodoList ctx={ctx} />
+    </Suspense>
   );
 }
 ```
 
 ## Client Components
 
-Mark with `"use client"`. Required for interactivity, browser APIs, event handlers, state, effects.
+Use `"use client"` for browser interactivity: state, effects, event handlers, DOM APIs, and client-side hooks.
 
 ```tsx
 "use client";
@@ -46,55 +41,46 @@ import { useState } from "react";
 
 export function Counter() {
   const [count, setCount] = useState(0);
-  return <button onClick={() => setCount(c => c + 1)}>Count: {count}</button>;
+  return <button onClick={() => setCount((n) => n + 1)}>Count: {count}</button>;
 }
 ```
 
-Keep client components small — they add to the JS bundle.
+Keep client components small; they add to the browser bundle.
 
 ## Server Functions
 
-### Basic Pattern
+Server functions live in `"use server"` files and can be called from client components.
 
 ```tsx
-// src/app/actions.ts
 "use server";
 
-import { requestInfo } from "rwsdk/worker";
+import { getRequestInfo } from "rwsdk/worker";
 
 export async function addTodo(formData: FormData) {
-  const { ctx } = requestInfo;
-  const title = formData.get("title") as string;
-  await db.insert(todos).values({
-    id: crypto.randomUUID(),
-    title,
-    userId: ctx.user.id,
-  });
+  const { ctx } = getRequestInfo();
+  const title = String(formData.get("title") ?? "");
+  await createTodo({ title, userId: ctx.user.id });
 }
 ```
-
-Client component calling server function:
 
 ```tsx
 "use client";
 
-import { addTodo } from "../actions";
+import { addTodo } from "./actions";
 
-export function AddTodoForm() {
+export function AddTodo() {
   return (
     <form action={addTodo}>
-      <input type="text" name="title" />
+      <input name="title" />
       <button type="submit">Add</button>
     </form>
   );
 }
 ```
 
-### `serverQuery` and `serverAction`
+## serverQuery
 
-Use these wrappers for better control over HTTP method and rehydration behavior.
-
-**`serverQuery`** — GET requests, no page rehydration:
+Use `serverQuery` for data-only reads. Default method is GET. It avoids page rehydration by returning only the action result.
 
 ```tsx
 "use server";
@@ -102,19 +88,22 @@ Use these wrappers for better control over HTTP method and rehydration behavior.
 import { serverQuery } from "rwsdk/worker";
 
 export const getTodos = serverQuery(async (userId: string) => {
-  return db.select().from(todos).where(eq(todos.userId, userId));
+  return listTodos(userId);
 });
 
-// With interruptors:
 export const getSecretData = serverQuery([
+  requireAuth,
   async () => {
-    if (!isAuthenticated()) throw new Response("Unauthorized", { status: 401 });
+    return "Secret Data";
   },
-  async () => "Secret Data",
 ]);
 ```
 
-**`serverAction`** — POST requests, triggers page rehydration:
+`serverQuery` sends an `x-rsc-data-only: true` request and RedwoodSDK skips expensive page rendering.
+
+## serverAction
+
+Use `serverAction` for mutations. Default method is POST. It rehydrates and re-renders with updated server state.
 
 ```tsx
 "use server";
@@ -122,75 +111,81 @@ export const getSecretData = serverQuery([
 import { serverAction } from "rwsdk/worker";
 
 export const createTodo = serverAction(async (title: string) => {
-  await db.insert(todos).values({
-    id: crypto.randomUUID(),
-    title,
-    completed: 0,
-  });
+  await insertTodo({ title });
 });
 
-// With interruptors:
 export const deleteTodo = serverAction([
   requireAuth,
   async (id: string) => {
-    await db.delete(todos).where(eq(todos.id, id));
+    await deleteTodoById(id);
   },
 ]);
 
-// Force GET method on an action:
 export const searchTodos = serverAction(
-  async (query: string) => { /* ... */ },
+  async (query: string) => {
+    return search(query);
+  },
   { method: "GET" },
 );
 ```
 
-### Returning Responses
+## Request Context
 
-Server functions can return Response objects for redirects or custom behavior:
+Server components receive `ctx` from route props. Server functions use `requestInfo` or `getRequestInfo()` from `rwsdk/worker`.
+
+```tsx
+import { getRequestInfo, requestInfo } from "rwsdk/worker";
+
+const { ctx } = getRequestInfo();
+const request = requestInfo.request;
+```
+
+Prefer `getRequestInfo()` when you want a hard failure outside request scope.
+
+## Returning Responses
+
+Server functions can return `Response` objects for redirects or custom metadata.
 
 ```tsx
 "use server";
 
 export async function createPost(formData: FormData) {
-  // ... create post ...
-  return Response.redirect("/posts", 303);
+  const id = await savePost(formData);
+  return Response.redirect(`/posts/${id}`, 303);
 }
 ```
 
-### Intercepting Action Responses (Client)
+RedwoodSDK handles 3xx `Location` redirects on the client. Other responses expose status and headers to client response handling.
+
+## Intercepting Action Responses
+
+Configure this in the client entry.
 
 ```tsx
 import { initClient } from "rwsdk/client";
 
 initClient({
   onActionResponse: (response) => {
-    console.log("Action returned status:", response.status);
-    // Return true to prevent default redirect behavior
+    if (response.status === 409) {
+      showConflictToast();
+      return true;
+    }
   },
 });
 ```
 
-## Context Access
-
-- **Server components**: `ctx` passed as props from route handlers
-- **Server functions**: `import { requestInfo } from "rwsdk/worker"; const { ctx } = requestInfo;`
-- Context is populated by middleware/interruptors, request-scoped
+Return `true` from `onActionResponse` to prevent default redirect handling.
 
 ## Manual Rendering
 
-For custom responses (error pages, emails):
+For custom worker responses, use worker rendering helpers when needed.
 
 ```tsx
 import { renderToStream, renderToString } from "rwsdk/worker";
-import { Document } from "@/app/Document";
 
-// Streaming:
 const stream = await renderToStream(<NotFound />, { Document });
 return new Response(stream, { status: 404 });
 
-// String:
-const html = await renderToString(<NotFound />, { Document });
-return new Response(html, { status: 404 });
+const html = await renderToString(<EmailPreview />, { Document });
+return new Response(html, { headers: { "Content-Type": "text/html" } });
 ```
-
-Options: `Document` (wrapper component), `rscPayload` (include RSC payload, default true for stream).

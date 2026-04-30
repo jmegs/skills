@@ -1,14 +1,14 @@
-# Platform — R2 Storage, Queues, Email, Cron
+# Platform: R2, Queues, Email, Cron
+
+Use Cloudflare bindings through `import { env } from "cloudflare:workers"`. After changing `wrangler.jsonc`, run `pnpm generate` or `npx wrangler types`.
 
 ## R2 Storage
 
-### Setup
+Create and bind a bucket:
 
 ```bash
 npx wrangler r2 bucket create my-bucket
 ```
-
-`wrangler.jsonc`:
 
 ```jsonc
 {
@@ -18,119 +18,94 @@ npx wrangler r2 bucket create my-bucket
 }
 ```
 
-Run `pnpm generate` after updating config.
-
-Bucket names: alphanumeric + hyphens only, must start/end with alphanumeric.
-
-### Upload
+Upload and download using standard streams.
 
 ```tsx
 import { env } from "cloudflare:workers";
+import { route } from "rwsdk/router";
 
 route("/upload", async ({ request }) => {
   const formData = await request.formData();
   const file = formData.get("file") as File;
-
   const key = `/storage/${file.name}`;
+
   await env.R2.put(key, file.stream(), {
     httpMetadata: { contentType: file.type },
   });
 
   return Response.json({ key });
-})
-```
+});
 
-### Download
-
-```tsx
 route("/download/*", async ({ params }) => {
   const object = await env.R2.get("/storage/" + params.$0);
-  if (!object) return new Response("Not Found", { status: 404 });
+  if (!object) return new Response("Object Not Found", { status: 404 });
+
   return new Response(object.body, {
-    headers: { "Content-Type": object.httpMetadata?.contentType as string },
+    headers: { "Content-Type": object.httpMetadata?.contentType ?? "application/octet-stream" },
   });
-})
+});
 ```
 
----
+Bucket names must start/end with alphanumeric and contain only lowercase letters, numbers, and hyphens.
 
-## Queues (Background Jobs)
+## Queues
 
-### Setup
+Create and bind producer/consumer queues:
 
 ```bash
-npx wrangler queues create my-queue
+npx wrangler queues create my-queue-name
 ```
-
-`wrangler.jsonc`:
 
 ```jsonc
 {
   "queues": {
     "producers": [
-      { "binding": "QUEUE", "queue": "my-queue" }
+      { "binding": "QUEUE", "queue": "my-queue-name" }
     ],
     "consumers": [
-      { "queue": "my-queue", "max_batch_size": 10, "max_batch_timeout": 5 }
+      { "queue": "my-queue-name", "max_batch_size": 10, "max_batch_timeout": 5 }
     ]
   }
 }
 ```
 
-Queue names: lowercase alphanumeric + hyphens, max 63 chars, no leading/trailing hyphens.
-
-### Send Messages
+Send messages from routes or server functions:
 
 ```tsx
-import { env } from "cloudflare:workers";
-
-route("/enqueue", () => {
-  env.QUEUE.send({ userId: 1, amount: 100, currency: "USD" });
+route("/enqueue", async () => {
+  await env.QUEUE.send({
+    type: "PAYMENT",
+    userId: 1,
+    amount: 100,
+    currency: "USD",
+  });
   return new Response("Queued");
-})
+});
 ```
 
-### Receive Messages
-
-Export a `queue` handler from the worker:
+Consume messages by exporting a Worker object:
 
 ```tsx
+const app = defineApp([/* routes */]);
+
 export default {
   fetch: app.fetch,
   async queue(batch) {
     for (const message of batch.messages) {
-      const { type, userId } = message.body as { type: string; userId: number };
-      if (type === "PAYMENT") {
-        // handle payment
+      if (batch.queue === "my-queue-name") {
+        const body = message.body as { type: string };
+        console.log(body.type);
       }
     }
   },
 } satisfies ExportedHandler<Env>;
 ```
 
-### Message Patterns
-
-For messages >128KB, store in R2 or KV and send the key:
-
-```ts
-// R2:
-await env.R2.put("msg/123.json", JSON.stringify(largeData));
-await env.QUEUE.send({ r2Key: "msg/123.json" });
-
-// KV:
-await env.KV.put("queue:msg:123", JSON.stringify(data), { expirationTtl: 600 });
-await env.QUEUE.send({ kvKey: "queue:msg:123" });
-```
-
-Route by queue name via `batch.queue`.
-
----
+Queue names must match `^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`. Messages have size limits; store large payloads in R2/KV and send a key.
 
 ## Email
 
-### Setup
-
-`wrangler.jsonc`:
+Outbound email uses a `send_email` binding.
 
 ```jsonc
 {
@@ -140,86 +115,65 @@ Route by queue name via `batch.queue`.
 }
 ```
 
-### Sending Email
+Production Cloudflare Email Routing requires verified destination addresses unless the binding config supplies an allowed destination. For arbitrary transactional delivery, use Cloudflare Email Service beta or an external provider.
 
 ```tsx
+import { EmailMessage } from "cloudflare:email";
 import { env } from "cloudflare:workers";
+import { createMimeMessage } from "mimetext";
 
 route("/email", async () => {
   const msg = createMimeMessage();
   msg.setSender({ name: "App", addr: "sender@example.com" });
   msg.setRecipient("recipient@example.com");
   msg.setSubject("Hello from Worker");
-  msg.addMessage({ contentType: "text/plain", data: "Email body here." });
+  msg.addMessage({ contentType: "text/plain", data: "Email body" });
 
-  const message = new EmailMessage(
-    "sender@example.com",
-    "recipient@example.com",
-    msg.asRaw(),
+  await env.EMAIL.send(
+    new EmailMessage("sender@example.com", "recipient@example.com", msg.asRaw()),
   );
-  await env.EMAIL.send(message);
+
   return Response.json({ ok: true });
-})
+});
 ```
 
-### Receiving Email
-
-The worker must extend `WorkerEntrypoint` to handle inbound email:
+Inbound email requires a Worker class that extends `WorkerEntrypoint`.
 
 ```tsx
 import PostalMime from "postal-mime";
+import { WorkerEntrypoint } from "cloudflare:workers";
+
+const app = defineApp([/* routes */]);
 
 export default class DefaultWorker extends WorkerEntrypoint<Env> {
-  async email(message: ForwardableEmailMessage) {
-    const parser = new PostalMime.default();
-    const rawEmail = new Response((message as any).raw);
-    const email = await parser.parse(await rawEmail.arrayBuffer());
-    console.log(email);
+  override async fetch(request: Request) {
+    return app.fetch(request, this.env, this.ctx);
   }
 
-  override async fetch(request: Request) {
-    return await app.fetch(request, this.env, this.ctx);
+  async email(message: ForwardableEmailMessage) {
+    const parser = new PostalMime();
+    const rawEmail = new Response((message as any).raw);
+    const email = await parser.parse(await rawEmail.arrayBuffer());
+    console.log(email.subject);
   }
 }
 ```
 
-### Replying to Inbound Email
-
-Set `In-Reply-To` header, then call `message.reply()`:
-
-```ts
-const reply = createMimeMessage();
-reply.setHeader("In-Reply-To", message.headers.get("Message-ID") ?? "");
-reply.setSender({ name: "Support", addr: "support@example.com" });
-reply.setRecipient(receivedEmail.from);
-reply.setSubject(`Re: ${receivedEmail.subject}`);
-reply.addMessage({ contentType: "text/plain", data: "Thanks for reaching out." });
-
-await message.reply(new EmailMessage("support@example.com", message.from, reply.asRaw()));
-```
-
-### Testing Locally
+Local inbound test endpoint:
 
 ```bash
-# Send: visit http://localhost:5173/email — .eml file path shown in console
+curl --request POST "http://localhost:5173/cdn-cgi/handler/email" \
+  --url-query "from=sender@example.com" \
+  --url-query "to=recipient@example.com" \
+  --header "Content-Type: text/plain" \
+  --data-raw "Subject: Test
 
-# Receive:
-curl --request POST 'http://localhost:5173/cdn-cgi/handler/email' \
-  --url-query 'from=sender@example.com' \
-  --url-query 'to=recipient@example.com' \
-  --header 'Content-Type: application/json' \
-  --data-raw 'From: "Test" <sender@example.com>
-Subject: Test Email
-Hello from test'
+Hello"
 ```
 
----
+## Cron
 
-## Cron Triggers
-
-### Setup
-
-`wrangler.jsonc`:
+Add schedules to `wrangler.jsonc`:
 
 ```jsonc
 {
@@ -229,30 +183,29 @@ Hello from test'
 }
 ```
 
-Export a `scheduled` handler:
+Export `scheduled`:
 
 ```tsx
+const app = defineApp([/* routes */]);
+
 export default {
   fetch: app.fetch,
   async scheduled(controller: ScheduledController) {
     switch (controller.cron) {
       case "* * * * *":
-        console.log("Minute-by-minute cleanup");
+        console.log("Minute cleanup");
         break;
       case "0 * * * *":
         console.log("Hourly metrics");
         break;
-      case "0 21 * * *":
-        console.log("Nightly billing at 9 PM UTC");
-        break;
+      default:
+        console.warn(`Unhandled cron: ${controller.cron}`);
     }
   },
 } satisfies ExportedHandler<Env>;
 ```
 
-Cron triggers only fire automatically after deploying to Cloudflare. Local dev does NOT schedule them.
-
-### Testing Locally
+Cron triggers fire automatically only after deploy. Local dev can trigger manually:
 
 ```bash
 curl "http://localhost:5173/cdn-cgi/handler/scheduled?cron=*+*+*+*+*"

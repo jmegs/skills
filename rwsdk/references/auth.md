@@ -1,10 +1,10 @@
 # Authentication
 
-## Session Management with Durable Objects
+RedwoodSDK provides a low-level session API based on Durable Objects. Use that as the stable baseline. The passkey addon is opt-in: use it when the user asks for passwordless WebAuthn or the project already uses it.
 
-RedwoodSDK provides `defineDurableSession` for persistent session storage via Durable Objects.
+## Session Durable Object
 
-### 1. Define Session Durable Object (`src/sessions/UserSession.ts`)
+Create a Durable Object that implements `getSession`, `saveSession`, and `revokeSession`.
 
 ```ts
 interface SessionData {
@@ -12,36 +12,31 @@ interface SessionData {
 }
 
 export class UserSession implements DurableObject {
-  private storage: DurableObjectStorage;
-  private session: SessionData | undefined = undefined;
+  private session: SessionData | undefined;
 
-  constructor(state: DurableObjectState) {
-    this.storage = state.storage;
-  }
+  constructor(private state: DurableObjectState) {}
 
   async getSession() {
-    if (!this.session) {
-      this.session = (await this.storage.get<SessionData>("session")) ?? {
-        userId: null,
-      };
-    }
+    this.session ??= (await this.state.storage.get<SessionData>("session")) ?? {
+      userId: null,
+    };
     return { value: this.session };
   }
 
   async saveSession(data: Partial<SessionData>) {
     this.session = { userId: data.userId ?? null };
-    await this.storage.put("session", this.session);
+    await this.state.storage.put("session", this.session);
     return this.session;
   }
 
   async revokeSession() {
-    await this.storage.delete("session");
+    await this.state.storage.delete("session");
     this.session = undefined;
   }
 }
 ```
 
-### 2. Configure Wrangler (`wrangler.jsonc`)
+## Wrangler Binding
 
 ```jsonc
 {
@@ -56,119 +51,101 @@ export class UserSession implements DurableObject {
 }
 ```
 
-### 3. Create Session Store (`src/worker.tsx`)
+Run `pnpm generate` after updating bindings.
+
+## Session Store
 
 ```ts
-import { defineDurableSession } from "rwsdk/auth";
 import { env } from "cloudflare:workers";
+import { defineDurableSession } from "rwsdk/auth";
+import { UserSession } from "./sessions/UserSession";
 
 export const sessionStore = defineDurableSession({
   sessionDurableObject: env.USER_SESSION_DO,
 });
 
-export { UserSession } from "@/sessions/UserSession";
+export { UserSession };
 ```
 
-### 4. Middleware — Populate ctx
+## Middleware
+
+Load session in global middleware and populate `ctx`.
 
 ```tsx
-import { defineApp, ErrorResponse } from "rwsdk/worker";
+import { ErrorResponse } from "rwsdk/worker";
 
-const app = defineApp([
-  setCommonHeaders(),
-  async ({ ctx, request, response }) => {
-    try {
-      ctx.session = await sessionStore.load(request);
-    } catch (error) {
-      if (error instanceof ErrorResponse && error.code === 401) {
-        await sessionStore.remove(request, response.headers);
-        response.headers.set("Location", "/user/login");
-        return new Response(null, { status: 302, headers: response.headers });
-      }
-      throw error;
+async function sessionMiddleware({ ctx, request, response }) {
+  try {
+    ctx.session = await sessionStore.load(request);
+  } catch (error) {
+    if (error instanceof ErrorResponse && error.code === 401) {
+      await sessionStore.remove(request, response.headers);
+      response.headers.set("Location", "/user/login");
+      return new Response(null, { status: 302, headers: response.headers });
     }
+    throw error;
+  }
 
-    if (ctx.session?.userId) {
-      const [user] = await db
-        .select()
-        .from(users)
-        .where(eq(users.id, ctx.session.userId));
-      ctx.user = user;
-    }
-  },
-  render(Document, [/* routes */]),
-]);
+  if (ctx.session?.userId) {
+    ctx.user = await findUser(ctx.session.userId);
+  }
+}
 ```
 
-### 5. Server Actions for Login/Logout
+## Server Functions
 
 ```ts
-// src/app/actions/auth.ts
 "use server";
 
+import { getRequestInfo } from "rwsdk/worker";
 import { sessionStore } from "../../worker";
-import { requestInfo } from "rwsdk/worker";
 
-export async function getCurrentUser() {
-  const session = await sessionStore.load(requestInfo.request);
+export async function getCurrentUserId() {
+  const { request } = getRequestInfo();
+  const session = await sessionStore.load(request);
   return session?.userId ?? null;
 }
 
 export async function loginAction(userId: string) {
-  await sessionStore.save(requestInfo.response.headers, { userId });
+  const { response } = getRequestInfo();
+  await sessionStore.save(response.headers, { userId });
 }
 
 export async function logoutAction() {
-  await sessionStore.remove(requestInfo.request, requestInfo.response.headers);
+  const { request, response } = getRequestInfo();
+  await sessionStore.remove(request, response.headers);
 }
 ```
 
-### 6. Client Component
+Session store methods:
+
+- `load(request)`: load from signed session cookie.
+- `save(responseHeaders, data)`: persist data and set cookie.
+- `remove(request, responseHeaders)`: revoke and clear cookie.
+
+## Route Guards
 
 ```tsx
-"use client";
-
-import { useState, useEffect, useTransition } from "react";
-import { loginAction, logoutAction, getCurrentUser } from "../actions/auth";
-
-export function AuthControls() {
-  const [userId, setUserId] = useState<string | null>(null);
-  const [isPending, startTransition] = useTransition();
-
-  useEffect(() => { getCurrentUser().then(setUserId); }, []);
-
-  return (
-    <div>
-      {userId ? <p>Logged in as: {userId}</p> : <p>Not logged in</p>}
-      <button
-        onClick={() => startTransition(async () => {
-          await loginAction("user-123");
-          setUserId("user-123");
-        })}
-        disabled={isPending}
-      >
-        Login
-      </button>
-      <button
-        onClick={() => startTransition(async () => {
-          await logoutAction();
-          setUserId(null);
-        })}
-        disabled={isPending}
-      >
-        Logout
-      </button>
-    </div>
-  );
+export async function requireAuth({ ctx }) {
+  if (!ctx.user) {
+    return new Response(null, {
+      status: 302,
+      headers: { Location: "/user/login" },
+    });
+  }
 }
+
+route("/account", [requireAuth, AccountPage]);
 ```
 
-## Passkey Authentication (WebAuthn)
+## Passkey Addon
 
-RedwoodSDK provides a bundled passkey addon for passwordless login:
+Use the passkey addon when the user wants passwordless WebAuthn auth or the project already adopted it.
 
 ```bash
 npx rwsdk addon passkey
 ```
 
-This downloads addon files and generates a local `INSTRUCTIONS.md` with step-by-step integration instructions. Follow that file to wire up registration and authentication flows.
+The addon downloads code into the project and generates local integration instructions. Follow the generated instructions rather than treating auth as hidden framework behavior.
+
+Migration note: existing live apps with custom D1/Prisma-style auth do not need to migrate to the passkey addon. Moving user/session data between implementations is manual and app-specific.

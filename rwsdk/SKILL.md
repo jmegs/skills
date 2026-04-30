@@ -1,144 +1,155 @@
 ---
 name: rwsdk
-description: Build full-stack web applications with RedwoodSDK (rwsdk) on Cloudflare Workers using TypeScript and React Server Components. Use when working with rwsdk projects, including routing (defineApp, route, prefix, render), middleware (worker.tsx, sessions, auth), interruptors (auth guards, validation, RBAC), React Server Components, client components ("use client"), server functions ("use server", serverQuery, serverAction, requestInfo), database (D1 — query with native bindings, Drizzle, or your preferred query layer), authentication (defineDurableSession, passkey/WebAuthn), storage (R2), background jobs (Queues), email (Email Workers), cron triggers, security (CSP, nonce), environment variables, or deployment. Trigger when the user mentions RedwoodSDK, rwsdk, or is working in a project that imports from "rwsdk/*".
+description: Build full-stack web applications with RedwoodSDK (rwsdk) on Cloudflare Workers using TypeScript and React Server Components. Use when working in projects that import from "rwsdk/*" or when the user mentions RedwoodSDK/rwsdk, including routing (defineApp, route, prefix, render, except, linkFor), middleware and interrupters, React Server Components, client components ("use client"), server functions ("use server", serverQuery, serverAction, requestInfo/getRequestInfo), Cloudflare bindings (D1, R2, Queues, Cron, Email Workers), session/auth with defineDurableSession, opt-in passkey addon, security headers/CSP nonce, environment variables, deployment, migration, or create-rwsdk.
 ---
 
 # RedwoodSDK
 
-React framework for Cloudflare. Server-side rendering, RSC, server functions, streaming. Zero magic — no hidden codegen or transpilation side effects. Composability over configuration. Web-first (native Request/Response/URL).
+React framework for Cloudflare. Starts as a Vite plugin; enables SSR, React Server Components, server functions, and streaming responses. Router and middleware use standard Web APIs: `Request`, `Response`, `URL`, headers, and Cloudflare bindings.
 
-## Project Structure
+Current docs source: `https://docs.rwsdk.com/llms.txt`. For API details, fetch current docs with ctx7 first.
 
-```
+## Project Shape
+
+```txt
 src/
-├── worker.tsx              # Entry: defineApp, middleware, routes
-├── client.tsx              # Client entry
-├── db/
-│   ├── schema.ts           # Database schema (e.g., Drizzle table defs)
-│   └── index.ts            # DB client instance
-├── sessions/
-│   └── UserSession.ts      # Session Durable Object
-└── app/
-    ├── Document.tsx         # HTML shell (used with render())
-    ├── interruptors.ts      # Shared interruptors (auth, validation)
-    └── pages/
-        └── <section>/
-            ├── routes.ts    # Co-located routes
-            └── Page.tsx
+├── worker.tsx              # Entry: defineApp, middleware, routes, Worker export
+├── client.tsx              # initClient/initClientNavigation
+├── app/
+│   ├── Document.tsx        # HTML shell used by render()
+│   ├── headers.ts          # app-owned security/header middleware
+│   └── pages/
+│       └── <section>/
+│           ├── routes.ts   # co-located routes
+│           └── Page.tsx
+├── db/                     # optional query layer; SDK is DB-agnostic
+└── sessions/               # optional Durable Object session classes
 ```
 
 ## Quick Reference
 
-### Worker Entry (`worker.tsx`)
+### Worker Entry
 
 ```tsx
-import { defineApp, route, render, prefix } from "rwsdk/router";
-import { setCommonHeaders } from "rwsdk/headers";
+import { defineApp } from "rwsdk/worker";
+import { route, render, prefix, except } from "rwsdk/router";
 import { Document } from "@/app/Document";
+import { setCommonHeaders } from "@/app/headers";
+import { routes as blogRoutes } from "@/app/pages/blog/routes";
 
-const app = defineApp([
+export const app = defineApp([
   setCommonHeaders(),
-  async ({ ctx, request, response }) => {
-    // Session/auth middleware — see references/auth.md
+  async ({ ctx, request, response, isAction }) => {
+    // Global middleware. Server Action requests also pass through here.
+    // Use isAction to skip page-only work.
   },
+  except((error) => {
+    console.error(error);
+    return new Response("Internal Server Error", { status: 500 });
+  }),
   render(Document, [
-    route("/", HomePage),
+    route("/", () => <HomePage />),
     prefix("/blog", blogRoutes),
   ]),
 ]);
 
-// Simple app:
-export default app;
-
-// With queues/cron/email, export object instead:
 export default {
   fetch: app.fetch,
-  async queue(batch) { /* ... */ },
-  async scheduled(controller) { /* ... */ },
 } satisfies ExportedHandler<Env>;
 ```
 
-### Route Handlers
+Simple apps can also `export default defineApp([...])`. If using Cron, Queues, Email, custom global error handling, or exported `app` for `linkFor`, export an object with `fetch: app.fetch`.
 
-Receive `{ request, params, ctx }`. Return JSX, `Response`, or `Response.json()`.
+### Routes
 
 ```tsx
-route("/users/:id", ({ params }) => <UserProfile id={params.id} />)
-route("/api/data", () => Response.json({ ok: true }))
-route("/api/users", { get: listUsers, post: createUser, delete: deleteUser })
-route("/admin", [requireAuth, isAdmin, AdminPage])  // interruptors run L→R
+route("/users/:id", ({ params }) => <UserProfile id={params.id} />);
+route("/files/*", ({ params }) => new Response(params.$0));
+route("/api/data", () => Response.json({ ok: true }));
+route("/api/users", {
+  get: listUsers,
+  head: listUsers, // HEAD is explicit; not auto-mapped from GET.
+  post: [requireAuth, createUser],
+  config: { disableOptions: true, disable405: true },
+});
+route("/admin", [requireAuth, isAdmin, AdminPage]); // interrupters run L->R
 ```
+
+Routes match in definition order. Use standard `new URL(request.url).searchParams` for query strings.
 
 ### Server Functions
 
 ```tsx
 // actions.ts
 "use server";
-import { serverAction, serverQuery, requestInfo } from "rwsdk/worker";
 
-// Mutations (POST, triggers rehydration):
-export const createItem = serverAction(async (formData: FormData) => {
-  const { ctx } = requestInfo;
-  // ...
-});
+import { getRequestInfo, serverAction, serverQuery } from "rwsdk/worker";
 
-// Reads (GET, no rehydration):
 export const getItems = serverQuery(async () => {
-  return db.select().from(items);
+  const { ctx } = getRequestInfo();
+  return listItemsFor(ctx.user.id);
+});
+
+export const createItem = serverAction(async (formData: FormData) => {
+  const { ctx } = getRequestInfo();
+  await createItemFor(ctx.user.id, String(formData.get("name")));
 });
 ```
 
-### Database
+Use `serverQuery` for data-only GET calls without page rehydration. Use `serverAction` for mutations; default POST triggers rehydration.
 
-D1 (Cloudflare's native SQLite) is the default database. rwsdk doesn't prescribe how you query it — native prepared statements, Drizzle, whatever you prefer.
+### Client Entry
 
 ```tsx
-// Native D1 binding:
+import { initClient, initClientNavigation } from "rwsdk/client";
+
+initClient({
+  onActionResponse: (response) => {
+    // Return true to prevent default redirect handling.
+  },
+});
+
+initClientNavigation({
+  scrollToTop: true,
+  scrollBehavior: "instant",
+});
+```
+
+## Data & Bindings
+
+RedwoodSDK is database-agnostic. Use Web/Cloudflare APIs directly and choose the query layer per project:
+
+```tsx
 import { env } from "cloudflare:workers";
+
 const { results } = await env.DB.prepare("SELECT * FROM todos").all();
-
-// Or with Drizzle ORM:
-import { drizzle } from "drizzle-orm/d1";
-const db = drizzle(env.DB, { schema });
-const allTodos = await db.select().from(todos);
 ```
 
-See [references/database.md](references/database.md) for full setup (D1 creation, migrations, query layer options).
-
-### Environment Variables
-
-```tsx
-import { env } from "cloudflare:workers";
-// Access bindings directly: env.DB, env.R2, env.QUEUE, env.EMAIL
-```
-
-### Context Types (`global.d.ts`)
-
-```tsx
-import { DefaultAppContext } from "rwsdk/worker";
-interface AppContext { user?: User; session?: { userId: string | null }; }
-declare module "rwsdk/worker" { interface DefaultAppContext extends AppContext {} }
-```
+D1 with native SQL or Drizzle is common on Cloudflare, but not required. Experimental SDK database and realtime primitives are opt-in only; do not make them the default path.
 
 ## References
 
-- **Routing**: See [references/routing.md](references/routing.md) — path matching, HTTP methods, query params, `linkFor`, prefetching, co-located routes
-- **Middleware**: See [references/middleware.md](references/middleware.md) — global middleware, session setup, context population
-- **Interruptors**: See [references/interruptors.md](references/interruptors.md) — auth guards, Zod validation, RBAC, composition
-- **React/RSC**: See [references/react.md](references/react.md) — server vs client components, `serverQuery`/`serverAction`, `renderToStream`/`renderToString`, context
-- **Database**: See [references/database.md](references/database.md) — D1 setup, query layer options (native, Drizzle, experimental Kysely)
-- **Authentication**: See [references/auth.md](references/auth.md) — `defineDurableSession`, session DO, passkey addon
-- **Platform**: See [references/platform.md](references/platform.md) — R2 storage, Queues, Email Workers, Cron Triggers
-- **Deployment**: See [references/deployment.md](references/deployment.md) — env vars, hosting, staging, security headers, CSP/nonce
+- **Routing**: [references/routing.md](references/routing.md) — matching, methods, interrupters, `except`, `render`, `linkFor`, prefetch
+- **Middleware**: [references/middleware.md](references/middleware.md) — global middleware, context, action pipeline, headers
+- **Interrupters**: [references/interruptors.md](references/interruptors.md) — route-scoped auth, validation, RBAC; "interruptors" accepted user spelling
+- **React/RSC**: [references/react.md](references/react.md) — server/client components, server functions, `serverQuery`/`serverAction`, responses
+- **Client**: [references/client.md](references/client.md) — `initClient`, `initClientNavigation`, `navigate`
+- **Database**: [references/database.md](references/database.md) — DB-agnostic approach, D1 native, Drizzle, opt-in experimental `rwsdk/db`
+- **Authentication**: [references/auth.md](references/auth.md) — `defineDurableSession`, session DO, opt-in passkey addon
+- **Platform**: [references/platform.md](references/platform.md) — R2, Queues, Email Workers, Cron
+- **Deployment**: [references/deployment.md](references/deployment.md) — env vars, hosting, security headers, CSP/nonce
+- **Migration**: [references/migration.md](references/migration.md) — 0.x to 1.x, `create-rwsdk`
+- **Experimental Realtime**: [references/realtime.md](references/realtime.md) — opt-in `useSyncedState`; not happy path
 
 ## Guidelines
 
-1. Use Web APIs over external deps (`fetch` not Axios, `Response.json()` for JSON).
-2. Co-locate routes in `src/app/pages/<section>/routes.ts`, import with `prefix`.
-3. Default to server components; `"use client"` only for interactivity.
-4. Keep client components small to minimize JS bundle.
-5. Interruptors for per-route concerns; middleware for global concerns.
-6. Access context via `requestInfo` in server functions, via props in server components.
-7. Use `import { env } from "cloudflare:workers"` for bindings — no env threading needed.
-8. D1 is the default database. rwsdk doesn't care how you query it — native prepared statements, Drizzle, etc.
-9. Use `serverAction` for mutations (POST), `serverQuery` for reads (GET).
+1. Fetch current docs for API questions; prefer `https://docs.rwsdk.com/llms.txt` and ctx7 `/websites/rwsdk`.
+2. Use Web APIs over external dependencies unless the project already chose a dependency.
+3. Keep route definitions explicit; co-locate section route arrays and compose with `prefix`.
+4. Use middleware for global concerns; use interrupters for route-specific concerns.
+5. Mutate `ctx` in middleware/interrupters; short-circuit by returning a `Response`.
+6. Default to server components; use `"use client"` only for browser interactivity.
+7. Access request context in server functions via `getRequestInfo()` or `requestInfo`.
+8. Access Cloudflare bindings via `import { env } from "cloudflare:workers"`.
+9. Keep database guidance agnostic; do not prescribe ORM or experimental storage by default.
+10. Mark experimental APIs explicitly and keep them out of the happy path.
